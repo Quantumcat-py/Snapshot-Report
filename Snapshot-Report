@@ -1,0 +1,81 @@
+import os
+from datetime import datetime
+
+timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+report_name = f"recon_report_{timestamp}.txt"
+
+print("[+] Building recon report...")
+
+with open(report_name, "w") as f:
+
+    f.write("="*60 + "\n")
+    f.write("        SYSTEM RECON / TRIAGE REPORT\n")
+    f.write("="*60 + "\n\n")
+
+    # Timestamp
+    f.write(f"Generated: {timestamp}\n\n")
+
+    # Hostname
+    f.write("=== HOSTNAME ===\n")
+    hostname = os.popen("hostname").read()
+    f.write(hostname + "\n")
+
+    # Current user
+    f.write("=== CURRENT USER ===\n")
+    user = os.popen("whoami").read()
+    f.write(user + "\n")
+
+    # Local IP
+    f.write("=== LOCAL IP ===\n")
+    ip = os.popen("hostname -I").read()
+    f.write(ip + "\n")
+
+    # Uptime
+    f.write("=== SYSTEM UPTIME ===\n")
+    uptime = os.popen("uptime").read()
+    f.write(uptime + "\n")
+
+    # Memory usage
+    f.write("=== MEMORY USAGE ===\n")
+    memory = os.popen("free -h").read()
+    f.write(memory + "\n")
+
+    # Disk usage
+    f.write("=== DISK USAGE ===\n")
+    disk = os.popen("df -h").read()
+    f.write(disk + "\n")
+
+    # Listening ports
+    f.write("=== LISTENING PORTS ===\n")
+    listening = os.popen("ss -tuln").read()
+    f.write(listening + "\n")
+
+    # Active connections
+    f.write("=== ACTIVE CONNECTIONS ===\n")
+    connections = os.popen("ss -tun").read()
+    f.write(connections + "\n")
+
+    # Top processes
+    f.write("=== TOP MEMORY PROCESSES ===\n")
+    processes = os.popen("ps aux --sort=-%mem | head").read()
+    f.write(processes + "\n")
+
+    # Basic suspicious process check
+    f.write("=== BASIC PROCESS CHECK ===\n")
+
+    suspicious = ["nc", "ncat", "hydra", "wireshark"]
+
+    running = os.popen("ps aux").read().lower()
+
+    found = False
+
+    for item in suspicious:
+        if item in running:
+            f.write(f"[!] Found process match: {item}\n")
+            found = True
+
+    if not found:
+        f.write("No flagged process names found.\n")
+
+print(f"[+] Recon report completed: {report_name}")
