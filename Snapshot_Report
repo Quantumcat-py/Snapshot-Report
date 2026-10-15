@@ -1,81 +1,440 @@
+#!/usr/bin/env python3
+"""snapshot_report -- a one-shot "state of this machine" triage report.
+
+One of the first scripts I wrote while teaching myself cybersecurity
+(May 2026). It writes a timestamped text report -- hostname, uptime,
+memory, disk, listening ports, active connections, top processes, and a
+basic check for suspicious-looking processes -- so future-you (or
+whoever helps you with your computer) has something concrete to compare
+against when something feels off.
+
+This is the updated version. What changed from the original:
+
+* The original's process check was a substring search through the whole
+  ``ps aux`` output for names like ``nc`` -- which also matches the "nc"
+  inside innocent words like "sync". It could absolutely cry wolf. The
+  check now compares actual *process names* against the list, exactly.
+* The flagged list is a bit broader (netcat variants, common
+  scanners/sniffers) and the section is labelled for what it is: a basic
+  name heuristic, not detection. Dual-use tools are often legitimate.
+* A connection summary is computed from the parsed data: active count,
+  listening count, unique external peers.
+* Everything is gathered with ``psutil`` instead of shelling out to a
+  chain of ``os.popen`` calls, so it works the same on Linux, Windows,
+  and macOS -- and every section degrades to an "(unavailable)" line
+  instead of taking the whole report down with it.
+
+Usage:
+    python3 snapshot_report [output_dir]
+
+Writes ``triage_report_YYYY-MM-DD_HH-MM-SS.txt`` into output_dir
+(default: the current directory) and prints where it landed.
+
+Requires: Python 3.9+ and psutil (``pip install psutil``).
+
+This script grew up into a full desktop app -- see the QuantumCat SOC
+Toolkit at https://quantumcatsoc.gumroad.com/l/quantumcat-soc-toolkit
+"""
+
+from __future__ import annotations
+
+import getpass
+import ipaddress
 import os
+import socket
+import sys
+import time
 from datetime import datetime
+from typing import Dict, List, Optional
 
-timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+try:
+    import psutil
+except ImportError:  # pragma: no cover - friendly failure, not a crash
+    psutil = None
 
-report_name = f"recon_report_{timestamp}.txt"
+# Dual-use tool names worth a second look. These are ALSO legitimate
+# admin tools -- a match is a prompt to look, not a verdict. The report
+# says so, in the report.
+FLAGGED_PROCESSES = [
+    "nc",
+    "ncat",
+    "netcat",
+    "socat",
+    "nmap",
+    "masscan",
+    "zmap",
+    "hydra",
+    "wireshark",
+    "tcpdump",
+    "ettercap",
+    "bettercap",
+    "mimikatz",
+]
 
-print("[+] Building recon report...")
+# CPython's ipaddress reports CGNAT space (100.64.0.0/10) as neither
+# private nor global; it's not publicly routable, so treat it as local.
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
-with open(report_name, "w") as f:
 
-    f.write("="*60 + "\n")
-    f.write("        SYSTEM RECON / TRIAGE REPORT\n")
-    f.write("="*60 + "\n\n")
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    # Timestamp
-    f.write(f"Generated: {timestamp}\n\n")
 
-    # Hostname
-    f.write("=== HOSTNAME ===\n")
-    hostname = os.popen("hostname").read()
-    f.write(hostname + "\n")
+def is_external(ip_text: str) -> bool:
+    """True only for a parseable, publicly routable address."""
+    try:
+        ip = ipaddress.ip_address((ip_text or "").strip())
+    except ValueError:
+        return False
+    if ip.version == _CGNAT.version and ip in _CGNAT:
+        return False
+    return bool(
+        ip.is_global
+        and not (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+    )
 
-    # Current user
-    f.write("=== CURRENT USER ===\n")
-    user = os.popen("whoami").read()
-    f.write(user + "\n")
 
-    # Local IP
-    f.write("=== LOCAL IP ===\n")
-    ip = os.popen("hostname -I").read()
-    f.write(ip + "\n")
+def fmt_bytes(num: float) -> str:
+    value = float(num)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
 
-    # Uptime
-    f.write("=== SYSTEM UPTIME ===\n")
-    uptime = os.popen("uptime").read()
-    f.write(uptime + "\n")
 
-    # Memory usage
-    f.write("=== MEMORY USAGE ===\n")
-    memory = os.popen("free -h").read()
-    f.write(memory + "\n")
+def normalise_process_name(name: str) -> str:
+    """Lowercase basename without a Windows ``.exe`` suffix."""
+    name = os.path.basename((name or "").strip()).lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name
 
-    # Disk usage
-    f.write("=== DISK USAGE ===\n")
-    disk = os.popen("df -h").read()
-    f.write(disk + "\n")
 
-    # Listening ports
-    f.write("=== LISTENING PORTS ===\n")
-    listening = os.popen("ss -tuln").read()
-    f.write(listening + "\n")
+def running_process_names() -> set:
+    """Set of normalised names of currently running processes."""
+    names = set()
+    for proc in psutil.process_iter(["name"]):
+        try:
+            normalised = normalise_process_name(proc.info.get("name") or "")
+            if normalised:
+                names.add(normalised)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return names
 
-    # Active connections
-    f.write("=== ACTIVE CONNECTIONS ===\n")
-    connections = os.popen("ss -tun").read()
-    f.write(connections + "\n")
 
-    # Top processes
-    f.write("=== TOP MEMORY PROCESSES ===\n")
-    processes = os.popen("ps aux --sort=-%mem | head").read()
-    f.write(processes + "\n")
+def check_flagged_processes() -> List[str]:
+    """Flagged names currently running -- whole-name match, not substring.
 
-    # Basic suspicious process check
-    f.write("=== BASIC PROCESS CHECK ===\n")
+    This is the fix for the original's bug: 'nc' no longer matches
+    'sync', 'rhythmbox', or random path fragments, because process
+    *names* are compared, not the raw process table text.
+    """
+    running = running_process_names()
+    return [name for name in FLAGGED_PROCESSES if name in running]
 
-    suspicious = ["nc", "ncat", "hydra", "wireshark"]
 
-    running = os.popen("ps aux").read().lower()
+# ---------------------------------------------------------------------------
+# Connection snapshot (shared shape with net_watch.py)
+# ---------------------------------------------------------------------------
 
-    found = False
+_PSUTIL_STATE_MAP = {
+    "ESTABLISHED": "ESTAB",
+    "SYN_SENT": "SYN-SENT",
+    "SYN_RECV": "SYN-RECV",
+    "FIN_WAIT1": "FIN-WAIT1",
+    "FIN_WAIT2": "FIN-WAIT2",
+    "TIME_WAIT": "TIME-WAIT",
+    "CLOSE_WAIT": "CLOSE-WAIT",
+    "LAST_ACK": "LAST-ACK",
+    "LISTEN": "LISTEN",
+    "CLOSING": "CLOSING",
+    "NONE": "",
+}
 
-    for item in suspicious:
-        if item in running:
-            f.write(f"[!] Found process match: {item}\n")
-            found = True
 
-    if not found:
-        f.write("No flagged process names found.\n")
+def snapshot_connections() -> List[Dict[str, object]]:
+    """Current connections as plain dicts (proto/state/endpoints/process)."""
+    names: Dict[int, str] = {}
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            if proc.info.get("name"):
+                names[int(proc.info["pid"])] = proc.info["name"]
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
 
-print(f"[+] Recon report completed: {report_name}")
+    conns: List[Dict[str, object]] = []
+    for c in psutil.net_connections(kind="inet"):
+        proto = "tcp" if int(c.type) == int(socket.SOCK_STREAM) else "udp"
+        if int(c.family) == int(socket.AF_INET6):
+            proto += "6"
+        raw_state = (c.status or "").upper()
+        state = _PSUTIL_STATE_MAP.get(raw_state, raw_state)
+        process = ""
+        if c.pid and names.get(c.pid):
+            process = f"{names[c.pid]} ({c.pid})"
+        peer_ip = c.raddr.ip if c.raddr else None
+        peer_port = str(c.raddr.port) if c.raddr else None
+        if peer_ip in ("0.0.0.0", "::"):
+            peer_ip, peer_port = None, None
+        conns.append(
+            {
+                "proto": proto,
+                "state": state,
+                "local_ip": c.laddr.ip if c.laddr else "",
+                "local_port": str(c.laddr.port) if c.laddr else "",
+                "peer_ip": peer_ip,
+                "peer_port": peer_port,
+                "process": process,
+            }
+        )
+    return conns
+
+
+def describe_conn(c: Dict[str, object]) -> str:
+    peer = f"{c['peer_ip']}:{c['peer_port']}" if c["peer_ip"] else "*:*"
+    return (
+        f"{c['proto']} {c['local_ip']}:{c['local_port']} -> {peer} "
+        f"({c['state'] or '-'})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Report sections -- each returns text, or an "(unavailable)" line.
+# A section failing must never take the whole report down with it.
+# ---------------------------------------------------------------------------
+
+
+def section(fn) -> str:
+    """Run a section gatherer; any failure becomes '(unavailable: ...)'."""
+    try:
+        return fn()
+    except Exception as exc:
+        return f"(unavailable: {exc})"
+
+
+def _uptime_text() -> str:
+    seconds = max(0, int(time.time() - psutil.boot_time()))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    return "up " + ", ".join(parts)
+
+
+def _memory_text() -> str:
+    vm = psutil.virtual_memory()
+    lines = [
+        f"Total:     {fmt_bytes(vm.total)}",
+        f"Used:      {fmt_bytes(vm.used)}",
+        f"Available: {fmt_bytes(vm.available)}",
+        f"Percent used: {vm.percent}%",
+    ]
+    try:
+        sm = psutil.swap_memory()
+        lines.append(
+            f"Swap: {fmt_bytes(sm.used)} used of {fmt_bytes(sm.total)} "
+            f"({sm.percent}%)"
+        )
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
+def _disk_text() -> str:
+    lines = []
+    seen = set()
+    for part in psutil.disk_partitions(all=False):
+        if part.mountpoint in seen:
+            continue
+        seen.add(part.mountpoint)
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+        except (PermissionError, OSError):
+            continue
+        lines.append(
+            f"{part.mountpoint}  total {fmt_bytes(usage.total)}  "
+            f"used {fmt_bytes(usage.used)}  free {fmt_bytes(usage.free)}  "
+            f"({usage.percent}% used)"
+        )
+    return "\n".join(lines) if lines else "(unavailable)"
+
+
+def _local_ip_text(connections: List[Dict[str, object]]) -> str:
+    ips = []
+    for conn in connections:
+        ip = str(conn["local_ip"])
+        if ip and ip not in ("0.0.0.0", "::") and ip not in ips:
+            ips.append(ip)
+    if not ips:
+        try:
+            ips.append(socket.gethostbyname(socket.gethostname()))
+        except OSError:
+            pass
+    return " ".join(ips) if ips else "(unavailable)"
+
+
+def _listening_text(connections: List[Dict[str, object]]) -> str:
+    listening = [c for c in connections if c["state"] == "LISTEN"]
+    if not listening:
+        return "(none)"
+    return "\n".join(
+        f"{c['proto']:<5} {c['local_ip']}:{c['local_port']}"
+        + (f"  {c['process']}" if c["process"] else "")
+        for c in listening
+    )
+
+
+def _active_text(connections: List[Dict[str, object]]) -> str:
+    if not connections:
+        return "(none)"
+    return "\n".join(
+        describe_conn(c) + (f"  {c['process']}" if c["process"] else "")
+        for c in connections
+    )
+
+
+def _top_processes_text() -> str:
+    rows = []
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            rss = proc.memory_info().rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+        rows.append((rss, proc.info.get("name") or "?", proc.info["pid"]))
+    rows.sort(reverse=True)
+    if not rows:
+        return "(unavailable)"
+    return "\n".join(
+        f"{name} (pid {pid}) -- {fmt_bytes(rss)}" for rss, name, pid in rows[:15]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Report assembly
+# ---------------------------------------------------------------------------
+
+
+def build_report_text() -> str:
+    """Build the full report body. Sections degrade independently."""
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    try:
+        connections = snapshot_connections()
+    except Exception:
+        connections = []
+
+    external_peers: List[str] = []
+    for conn in connections:
+        peer = conn["peer_ip"]
+        if peer and is_external(str(peer)) and peer not in external_peers:
+            external_peers.append(str(peer))
+    listening = [c for c in connections if c["state"] == "LISTEN"]
+    flagged = section(check_flagged_processes)
+    if not isinstance(flagged, list):
+        flagged = []
+
+    lines: List[str] = []
+    add = lines.append
+    add("=" * 60)
+    add("        SYSTEM SNAPSHOT / TRIAGE REPORT")
+    add("        QuantumCat SOC Toolkit")
+    add("=" * 60)
+    add("")
+    add(f"Generated: {timestamp}")
+    add("")
+    add("=== HOSTNAME ===")
+    add(section(socket.gethostname))
+    add("")
+    add("=== CURRENT USER ===")
+    add(section(getpass.getuser))
+    add("")
+    add("=== LOCAL IP ===")
+    add(section(lambda: _local_ip_text(connections)))
+    add("")
+    add("=== SYSTEM UPTIME ===")
+    add(section(_uptime_text))
+    add("")
+    add("=== MEMORY USAGE ===")
+    add(section(_memory_text))
+    add("")
+    add("=== DISK USAGE ===")
+    add(section(_disk_text))
+    add("")
+    add("=== CONNECTION SUMMARY ===")
+    add(f"Active connections seen: {len(connections)}")
+    add(f"Listening sockets: {len(listening)}")
+    add(f"Unique external peers: {len(external_peers)}")
+    for ip in external_peers[:20]:
+        add(f"  - {ip}")
+    add("")
+    add("=== LISTENING PORTS ===")
+    add(section(lambda: _listening_text(connections)))
+    add("")
+    add("=== ACTIVE CONNECTIONS ===")
+    add(section(lambda: _active_text(connections)))
+    add("")
+    add("=== TOP MEMORY PROCESSES ===")
+    add(section(_top_processes_text))
+    add("")
+    add("=== BASIC PROCESS CHECK (heuristic) ===")
+    add(
+        "Name-based check against a short list of dual-use tools "
+        "(scanners, sniffers, netcat-style utilities). These are often"
+    )
+    add("legitimate admin tools -- a match means 'worth a look', not")
+    add("'something is wrong'. Absence of a match is not proof of safety.")
+    if flagged:
+        for name in flagged:
+            add(f"[!] Found running process matching: {name}")
+    else:
+        add("No flagged process names found.")
+    add("")
+    add("End of report.")
+    return "\n".join(lines) + "\n"
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    out_dir = argv[0] if argv else "."
+
+    if psutil is None:
+        print("snapshot_report needs the 'psutil' package:  pip install psutil")
+        print("(Everything else it uses is the Python standard library.)")
+        return 1
+
+    print("[+] Building snapshot report...")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as exc:
+        print(f"[!] Could not create output directory '{out_dir}': {exc}")
+        return 1
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"triage_report_{timestamp}.txt"
+    path = os.path.join(out_dir, filename)
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(build_report_text())
+    except OSError as exc:
+        print(f"[!] Could not write the report: {exc}")
+        return 1
+
+    print(f"[+] Snapshot report completed: {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
