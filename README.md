@@ -6,28 +6,46 @@ compare later, or hand to whoever helps you with your computer.
 
 ## What it does
 
-The script runs a batch of system commands (mostly `os.popen` calls)
-and writes a timestamped text report: system info, processes,
-connections, and a basic check for suspicious-looking processes. The
-idea is a triage snapshot — capture what the machine looks like *now*,
-so future-you (or your more technical friend) has something concrete
-to compare against when something feels off.
-
-## Run it
+Run it and it writes a timestamped text report
+(`triage_report_YYYY-MM-DD_HH-MM-SS.txt`): hostname, current user,
+local IP, uptime, memory, disk, a connection summary (active count,
+listening count, unique external peers), listening ports, active
+connections, top processes by memory, and a basic check for
+suspicious-looking processes. The idea is a triage snapshot — capture
+what the machine looks like *now*, so future-you (or your more
+technical friend) has something concrete to compare against when
+something feels off.
 
 ```bash
-python3 snapshot_report
+pip install psutil   # the one dependency; everything else is stdlib
+python3 snapshot_report            # report lands in the current folder
+python3 snapshot_report ~/reports  # or pick a folder
 ```
 
-## Honest notes
+## Updated
 
-- The "suspicious process" check is a **substring search** through the
-  `ps aux` output for names like `nc` — which also matches the "nc"
-  inside innocent words like "sync". It can absolutely cry wolf. It's
-  a beginner's first idea of detection, and it taught me why real
-  detection is harder than it looks.
-- Every command runs bare, so if one fails, you'll hear about it.
-  There's no graceful degradation in this version.
+The original (May 2026) gathered everything with bare `os.popen` calls
+to Linux tools, and its process check had a bug I learned a lot from.
+This version keeps the same sections and the same purpose, rebuilt
+properly:
+
+- **The process check compares actual process names now.** The
+  original was a **substring search** through the `ps aux` output for
+  names like `nc` — which also matches the "nc" inside innocent words
+  like "sync". It could absolutely cry wolf. Names are now matched
+  exactly, the list is a bit broader (netcat variants, common
+  scanners/sniffers), and the section is labelled in the report as
+  what it is: a basic name heuristic, not detection. Dual-use tools
+  are often legitimate, and the report says so.
+- **A computed connection summary** — active connections, listening
+  sockets, unique external peers — instead of just dumping raw
+  command output.
+- **Gathered with `psutil`**, so the same script works on Linux,
+  Windows, and macOS.
+- **Graceful degradation.** Every section is independent: if one
+  can't be gathered it becomes an "(unavailable)" line instead of
+  crashing the whole report. The original ran every command bare, so
+  if one failed, you heard about it.
 
 ## This grew up → the QuantumCat SOC Toolkit
 
@@ -38,16 +56,8 @@ idea held up best: the one-click report is the heart of the app.
 
 What the app version adds:
 
-- **One click** in a GUI tab builds the timestamped report: hostname,
-  uptime, memory, disk, listening ports, active connections, top
-  processes — plus a computed connection summary (active count,
-  listening count, unique external peers)
-- The flagged-process check now compares actual **process names**
-  instead of substrings, and it's labelled in the app as what it is:
-  a basic name heuristic, not detection. Dual-use tools are often
-  legitimate, and the report says so
-- Every section degrades to an "(unavailable)" line instead of
-  crashing the whole report
+- The same report from a **GUI button**, saved to a proper per-user
+  data folder, with the highlights fed straight to the analyst
 - The other two tools built in: a live connection monitor with
   LOCAL/EXTERNAL tagging and top talkers, and a threaded port scanner
 - An **AI Analyst** tab that reads the report's highlights and explains
