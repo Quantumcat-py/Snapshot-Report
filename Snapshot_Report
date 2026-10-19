@@ -24,6 +24,20 @@ This is the updated version. What changed from the original:
   and macOS -- and every section degrades to an "(unavailable)" line
   instead of taking the whole report down with it.
 
+What this update (v1.2) adds:
+
+* A NETWORK CONTEXT section: primary IP, subnet/CIDR, default
+  gateway, configured DNS servers, and OS version -- the local
+  context you need to judge whether a peer is on your subnet, your
+  LAN, or the open internet. (Gateway/DNS gathering is Linux-only
+  for now; other platforms honestly print "(unavailable)".)
+* Reverse-DNS names next to the external peers in the connection
+  summary, clearly labelled as lookup results -- they can be missing
+  or wrong, and the report says so. Lookups are capped at 20 peers
+  with a short timeout so the report stays fast.
+* The header now records how long the report took to build.
+  All of the new lookups use only the standard library.
+
 Usage:
     python3 snapshot_report [output_dir]
 
@@ -41,9 +55,12 @@ from __future__ import annotations
 import getpass
 import ipaddress
 import os
+import platform
+import re
 import socket
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -209,6 +226,133 @@ def describe_conn(c: Dict[str, object]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Network context + reverse DNS (v1.2, standard library only)
+# ---------------------------------------------------------------------------
+
+
+def _primary_ip(connections: List[Dict[str, object]]) -> Optional[str]:
+    """Primary outbound IPv4: a UDP 'connect' picks the source address
+    the kernel would use (no traffic is actually sent)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        if ip and ip != "0.0.0.0":
+            return ip
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    for conn in connections:
+        ip = str(conn["local_ip"])
+        if ip and ip not in ("0.0.0.0", "::") and ":" not in ip:
+            return ip
+    return None
+
+
+def _subnet_cidr(primary_ip: Optional[str]) -> Optional[str]:
+    if not primary_ip:
+        return None
+    for addrs in psutil.net_if_addrs().values():
+        for addr in addrs:
+            if addr.family == socket.AF_INET and addr.address == primary_ip:
+                if addr.netmask:
+                    try:
+                        return str(
+                            ipaddress.ip_interface(
+                                f"{primary_ip}/{addr.netmask}"
+                            ).network
+                        )
+                    except ValueError:
+                        return None
+    return None
+
+
+def _default_gateway() -> Optional[str]:
+    """Linux: parse /proc/net/route. Other platforms: unavailable --
+    psutil has no gateway API and guessing is worse than saying so."""
+    try:
+        with open("/proc/net/route", encoding="utf-8") as fh:
+            for line in fh.read().splitlines()[1:]:
+                fields = line.split()
+                if len(fields) >= 3 and fields[1] == "00000000":
+                    hex_ip = fields[2]
+                    octets = [int(hex_ip[i:i + 2], 16) for i in (6, 4, 2, 0)]
+                    return ".".join(str(o) for o in octets)
+    except OSError:
+        pass
+    return None
+
+
+def _dns_servers() -> List[str]:
+    """Linux: /etc/resolv.conf nameservers. Other platforms report
+    unavailable rather than parsing locale-dependent tool output."""
+    servers: List[str] = []
+    try:
+        with open("/etc/resolv.conf", encoding="utf-8") as fh:
+            for line in fh:
+                match = re.match(r"\s*nameserver\s+(\S+)", line)
+                if match and match.group(1) not in servers:
+                    servers.append(match.group(1))
+    except OSError:
+        pass
+    return servers
+
+
+def _network_context(connections: List[Dict[str, object]]) -> Dict[str, object]:
+    primary = _primary_ip(connections)
+    return {
+        "primary_ip": primary,
+        "subnet_cidr": _subnet_cidr(primary),
+        "default_gateway": _default_gateway(),
+        "dns_servers": _dns_servers(),
+        "os": (
+            f"{platform.system()} {platform.release()} "
+            f"({platform.version()}) {platform.machine()}"
+        ).strip(),
+    }
+
+
+def _reverse_dns_map(peers: List[str]) -> Dict[str, Optional[str]]:
+    """Reverse-DNS for up to the first 20 peers, in parallel, with a
+    short timeout. Failures are None: a lookup result, not evidence."""
+    targets = list(peers[:20])
+    if not targets:
+        return {}
+
+    def _lookup(ip: str) -> Optional[str]:
+        try:
+            return socket.gethostbyaddr(ip)[0]
+        except (socket.herror, socket.gaierror, OSError):
+            return None
+
+    results: Dict[str, Optional[str]] = {}
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(3.0)
+    try:
+        with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+            for ip, name in zip(targets, pool.map(_lookup, targets)):
+                results[ip] = name
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+    return results
+
+
+def _network_context_text(connections: List[Dict[str, object]]) -> str:
+    ctx = _network_context(connections)
+    dns = ctx["dns_servers"] or []
+    return "\n".join(
+        [
+            f"Primary IP: {ctx['primary_ip'] or '(unavailable)'}",
+            f"Subnet: {ctx['subnet_cidr'] or '(unavailable)'}",
+            f"Default gateway: {ctx['default_gateway'] or '(unavailable)'}",
+            "DNS servers: " + (", ".join(dns) if dns else "(unavailable)"),
+            f"Operating system: {ctx['os']}",
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
 # Report sections -- each returns text, or an "(unavailable)" line.
 # A section failing must never take the whole report down with it.
 # ---------------------------------------------------------------------------
@@ -330,6 +474,7 @@ def _top_processes_text() -> str:
 
 def build_report_text() -> str:
     """Build the full report body. Sections degrade independently."""
+    build_started = time.perf_counter()
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     try:
         connections = snapshot_connections()
@@ -342,6 +487,7 @@ def build_report_text() -> str:
         if peer and is_external(str(peer)) and peer not in external_peers:
             external_peers.append(str(peer))
     listening = [c for c in connections if c["state"] == "LISTEN"]
+    rdns = _reverse_dns_map(external_peers)
     flagged = section(check_flagged_processes)
     if not isinstance(flagged, list):
         flagged = []
@@ -364,6 +510,9 @@ def build_report_text() -> str:
     add("=== LOCAL IP ===")
     add(section(lambda: _local_ip_text(connections)))
     add("")
+    add("=== NETWORK CONTEXT ===")
+    add(section(lambda: _network_context_text(connections)))
+    add("")
     add("=== SYSTEM UPTIME ===")
     add(section(_uptime_text))
     add("")
@@ -377,8 +526,12 @@ def build_report_text() -> str:
     add(f"Active connections seen: {len(connections)}")
     add(f"Listening sockets: {len(listening)}")
     add(f"Unique external peers: {len(external_peers)}")
+    if external_peers:
+        add("(Reverse-DNS names below are lookup results and can be "
+            "missing or wrong -- treat them as a hint, not a verdict.)")
     for ip in external_peers[:20]:
-        add(f"  - {ip}")
+        name = rdns.get(ip)
+        add(f"  - {ip}  (reverse DNS: {name})" if name else f"  - {ip}")
     add("")
     add("=== LISTENING PORTS ===")
     add(section(lambda: _listening_text(connections)))
@@ -402,6 +555,12 @@ def build_report_text() -> str:
     else:
         add("No flagged process names found.")
     add("")
+    build_seconds = time.perf_counter() - build_started
+    for idx, line in enumerate(lines):
+        if line.startswith("Generated:"):
+            lines.insert(
+                idx + 1, f"Report build time: {build_seconds:.2f} seconds")
+            break
     add("End of report.")
     return "\n".join(lines) + "\n"
 
