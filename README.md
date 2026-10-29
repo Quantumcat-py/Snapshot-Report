@@ -4,6 +4,12 @@ A small Python script I wrote while teaching myself cybersecurity. It
 builds a timestamped "state of this machine" report you can save,
 compare later, or hand to whoever helps you with your computer.
 
+> **Note:** this is a standalone script update, not the app update.
+> The packaged QuantumCat SOC Toolkit update ships only when all
+> three of its tools have something new to add — until then, the
+> app on Gumroad is still the previous version, and this script is
+> the preview of what's coming.
+
 ## What it does
 
 Run it and it writes a timestamped text report
@@ -27,9 +33,10 @@ python3 Snapshot_Report ~/reports  # or pick a folder
 
 ## v1.2 — October 2026
 
-This script is being updated in step with the QuantumCat SOC
-Toolkit's v1.2 update, rolling out this week. What changed this
-round:
+This script is updated ahead of the QuantumCat SOC Toolkit's v1.2
+app update. The app update itself is not live yet — it ships only
+when all three tools have something new to add. What changed in
+this script this round:
 
 - **A NETWORK CONTEXT section.** The report now records the
   machine's primary IP, its subnet, the default gateway, the
